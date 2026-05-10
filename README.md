@@ -82,6 +82,10 @@ bun run api2codex.ts
 | `GET` | `/v1/models` | Proxied model list from upstream |
 | `GET` | `/health` | Health check — returns `{"status":"ok","version":"..."}` |
 
+## Acknowledgements
+
+Based on [talkcozy/api2codex](https://github.com/talkcozy/api2codex). Thanks to the original authors for the concept and implementation.
+
 ## License
 
 MIT
