@@ -135,9 +135,9 @@ function buildChatRequest(body: Record<string, unknown>): ChatRequest {
     stream:   (body.stream as boolean) ?? false,
   };
 
-  if (body.temperature != null) req.temperature  = body.temperature as number;
-  if (body.max_output_tokens != null) req.max_tokens = body.max_output_tokens as number;
-  if (body.top_p != null)        req.top_p        = body.top_p as number;
+  if (body.temperature != null)      req.temperature = body.temperature as number;
+  if (body.max_output_tokens != null) req.max_tokens  = body.max_output_tokens as number;
+  if (body.top_p != null)            req.top_p        = body.top_p as number;
 
   const rawTools = body.tools as Record<string, unknown>[] | undefined;
   if (rawTools?.length) {
@@ -278,7 +278,7 @@ async function* streamChatToResponses(chatReq: ChatRequest, model: string, respI
     buf += decoder.decode(value, { stream: true });
 
     const lines = buf.split("\n");
-    buf = lines.pop() ?? "";           // keep incomplete last line
+    buf = lines.pop() ?? "";
 
     for (const line of lines) {
       if (!line.startsWith("data: ")) continue;
@@ -302,14 +302,12 @@ async function* streamChatToResponses(chatReq: ChatRequest, model: string, respI
       const delta        = (choices[0].delta as Record<string, unknown>) ?? {};
       const finishReason = choices[0].finish_reason as string | undefined;
 
-      // reasoning
       const reasoning = delta.reasoning_content as string | undefined;
       if (reasoning) {
         yield sse({ type: "response.reasoning_text.delta", item_id: msgId,
           output_index: 0, content_index: 0, delta: reasoning });
       }
 
-      // text
       const text = delta.content as string | undefined;
       if (text) {
         fullText += text;
@@ -317,7 +315,6 @@ async function* streamChatToResponses(chatReq: ChatRequest, model: string, respI
           output_index: 0, content_index: 0, delta: text });
       }
 
-      // tool calls
       const deltaTCs = delta.tool_calls as Record<string, unknown>[] | undefined;
       if (deltaTCs?.length) {
         for (const tc of deltaTCs) {
@@ -361,10 +358,8 @@ async function* streamChatToResponses(chatReq: ChatRequest, model: string, respI
     }
   }
 
-  // close text message if still open
   for (const ev of closeMsgItem()) yield ev;
 
-  // flush any remaining tool calls
   for (const [tcIdx, tcInfo] of [...activeToolCalls.entries()].sort(([a],[b]) => a - b)) {
     if (!completedToolCalls.includes(tcInfo)) {
       completedToolCalls.push(tcInfo);
@@ -376,7 +371,6 @@ async function* streamChatToResponses(chatReq: ChatRequest, model: string, respI
     }
   }
 
-  // build final output
   const outputItems: unknown[] = [];
   if (fullText) outputItems.push({ id: msgId, type: "message", role: "assistant",
     status: "completed", content: [{ type: "output_text", text: fullText, annotations: [] }] });
@@ -396,72 +390,66 @@ async function* streamChatToResponses(chatReq: ChatRequest, model: string, respI
   yield "data: [DONE]\n\n";
 }
 
-// ── Router ─────────────────────────────────────────────────────────────────
+// ── Route handlers ─────────────────────────────────────────────────────────
 
-async function router(req: Request): Promise<Response> {
-  const url = new URL(req.url);
+function handleHealth(): Response {
+  return Response.json({ status: "ok", version: VERSION });
+}
 
-  if (req.method === "GET" && url.pathname === "/health") {
-    return Response.json({ status: "ok", version: VERSION });
-  }
+async function handleModels(): Promise<Response> {
+  const resp = await fetch(`${UPSTREAM_BASE_URL}/models`, {
+    headers: { "Authorization": `Bearer ${UPSTREAM_API_KEY}` },
+  });
+  return new Response(resp.body, { status: resp.status, headers: { "Content-Type": "application/json" } });
+}
 
-  if (req.method === "GET" && url.pathname === "/v1/models") {
-    const resp = await fetch(`${UPSTREAM_BASE_URL}/models`, {
-      headers: { "Authorization": `Bearer ${UPSTREAM_API_KEY}` },
+async function handleResponses(req: Request): Promise<Response> {
+  let body: Record<string, unknown>;
+  try { body = await req.json(); }
+  catch { return Response.json({ error: "invalid JSON" }, { status: 400 }); }
+
+  const model  = (body.model as string) || DEFAULT_MODEL;
+  const stream = (body.stream as boolean) ?? false;
+  const respId = makeId("resp");
+
+  log.info(`Request: model=${model} stream=${stream} input_type=${typeof body.input}`);
+
+  const chatReq = buildChatRequest(body);
+  log.debug(`Chat request: stream=${chatReq.stream} msgs=${chatReq.messages.length} model=${chatReq.model} tools=${chatReq.tools?.length ?? 0}`);
+
+  if (stream) {
+    const gen = streamChatToResponses(chatReq, model, respId);
+    const readable = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const { value, done } = await gen.next();
+        if (done) { controller.close(); return; }
+        controller.enqueue(new TextEncoder().encode(value));
+      },
+      async cancel() { await gen.return(undefined); },
     });
-    return new Response(resp.body, { status: resp.status, headers: { "Content-Type": "application/json" } });
+    return new Response(readable, {
+      headers: {
+        "Content-Type":  "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection":    "keep-alive",
+        "X-Request-Id":  respId,
+      },
+    });
   }
 
-  if (req.method === "POST" && url.pathname === "/v1/responses") {
-    let body: Record<string, unknown>;
-    try { body = await req.json(); }
-    catch { return Response.json({ error: "invalid JSON" }, { status: 400 }); }
-
-    const model   = (body.model as string) || DEFAULT_MODEL;
-    const stream  = (body.stream as boolean) ?? false;
-    const respId  = makeId("resp");
-
-    log.info(`Request: model=${model} stream=${stream} input_type=${typeof body.input}`);
-
-    const chatReq = buildChatRequest(body);
-    log.debug(`Chat request: stream=${chatReq.stream} msgs=${chatReq.messages.length} model=${chatReq.model} tools=${chatReq.tools?.length ?? 0}`);
-
-    if (stream) {
-      const gen = streamChatToResponses(chatReq, model, respId);
-      const readable = new ReadableStream<Uint8Array>({
-        async pull(controller) {
-          const { value, done } = await gen.next();
-          if (done) { controller.close(); return; }
-          controller.enqueue(new TextEncoder().encode(value));
-        },
-        async cancel() { await gen.return(undefined); },
-      });
-      return new Response(readable, {
-        headers: {
-          "Content-Type":  "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Connection":    "keep-alive",
-          "X-Request-Id":  respId,
-        },
-      });
-    } else {
-      let upstreamResp: Response;
-      try {
-        upstreamResp = await fetch(`${UPSTREAM_BASE_URL}/chat/completions`, {
-          method: "POST",
-          headers: { "Authorization": `Bearer ${UPSTREAM_API_KEY}`, "Content-Type": "application/json" },
-          body: JSON.stringify(chatReq),
-        });
-      } catch (err) {
-        return Response.json({ error: String(err) }, { status: 502 });
-      }
-
-      const chatResp: Record<string, unknown> = await upstreamResp.json();
-      return Response.json(chatResponseToResponses(chatResp, model, respId));
-    }
+  let upstreamResp: Response;
+  try {
+    upstreamResp = await fetch(`${UPSTREAM_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${UPSTREAM_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify(chatReq),
+    });
+  } catch (err) {
+    return Response.json({ error: String(err) }, { status: 502 });
   }
 
-  return Response.json({ error: "not found" }, { status: 404 });
+  const chatResp: Record<string, unknown> = await upstreamResp.json();
+  return Response.json(chatResponseToResponses(chatResp, model, respId));
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────
@@ -472,4 +460,15 @@ if (!UPSTREAM_API_KEY)  { log.error("UPSTREAM_API_KEY is required");  process.ex
 log.info(`Starting api2codex v${VERSION} on ${HOST}:${PORT}`);
 log.info(`Upstream: ${UPSTREAM_BASE_URL}`);
 
-Bun.serve({ hostname: HOST, port: PORT, fetch: router });
+Bun.serve({
+  hostname: HOST,
+  port:     PORT,
+  routes: {
+    "/health":       { GET: handleHealth },
+    "/v1/models":    { GET: handleModels },
+    "/v1/responses": { POST: handleResponses },
+  },
+  fetch() {
+    return Response.json({ error: "not found" }, { status: 404 });
+  },
+});
